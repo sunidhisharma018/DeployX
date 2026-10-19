@@ -1,0 +1,135 @@
+import 'dotenv/config'
+import express from "express";
+import cors from "cors";
+import simpleGit from "simple-git"
+import { generate } from "./utils";
+import path from "path";
+import { getAllFiles } from "./file";
+import { uploadFile } from "./aws";
+import {createClient} from "redis";
+
+const redURL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379';
+
+const subscriber = createClient({
+    url: redURL
+});
+
+const publisher = createClient({
+    url: redURL
+});
+
+subscriber.on("error", err =>
+    console.error("Redis Subscriber Error:", err)
+);
+
+publisher.on("error", err =>
+    console.error("Redis Publisher Error:", err)
+);
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+console.log(__dirname);
+
+app.post("/deploy",async(req,res)=>{
+    const repoURL = req.body.repoURL || req.body.repoUrl;
+
+    const id = generate(); //to generate a random id and add the cloned repo
+    
+    try{
+        // abort the clone if git produces no output for 2 minutes (e.g. network stall)
+        await simpleGit({ timeout: { block: 120000 } }).clone(repoURL,path.join(__dirname,`output/${id}`),
+        // shallow cloning ignores a few deps; --progress keeps output flowing so the timeout only fires on a real stall
+        ["--depth","1","--progress"]
+    );
+    }catch(err){
+        console.log(err);
+        return res.status(500).json({
+            error:"cloning failed"
+        })
+    }
+
+    const outputRoot = path.join(__dirname, "output");
+    const repoRoot = path.join(outputRoot, id);
+
+    // Compare whole path segments so .gitignore / .github aren't dropped along with .git
+    const files = getAllFiles(repoRoot).filter(file => {
+        const segments = path.relative(repoRoot, file).split(path.sep);
+        return !segments.includes(".git") && !segments.includes("node_modules");
+    });
+
+    try {
+        await Promise.all(
+            files.map(async file=>{
+                // Always upload as output/<id>/... using forward slashes for object keys.
+                const relativePath = path.relative(outputRoot, file).split(path.sep).join('/');
+                await uploadFile(`output/${relativePath}`, file);
+            })
+        );
+    } catch (err) {
+        console.error("Upload to storage failed", err);
+        await publisher.hSet("status", id, "failed").catch(() => {});
+        return res.status(500).json({
+            error: "uploading source to storage failed"
+        });
+    }
+
+    // Set status before queueing so the worker's "deployed" can't be overwritten by "uploaded"
+    await publisher.hSet("status",id,"uploaded");
+    await publisher.lPush("build-queue",id);
+    //const val = hget
+    console.log(repoURL);
+
+
+    res.json({
+        id,
+        message: `repo url logged with id: ${id}`
+    });
+})
+
+app.get("/health",(req,res)=>{
+    console.log("The server is up :)");
+    res.json({
+        message:"the backend is up!"
+    })
+})
+
+app.get("/status",async(req,res)=>{
+    const id = req.query.id;
+    const response = await subscriber.hGet("status",id as string);
+    res.json({
+        status:response
+    })
+})
+
+app.get("/logs", async (req, res) => {
+    const id = req.query.id;
+    if (!id) {
+        return res.status(400).json({ error: "Missing deployment id" });
+    }
+    try {
+        const logs = await subscriber.lRange(`logs:${id}`, 0, -1);
+        res.json({ logs });
+    } catch (err: any) {
+        console.error("Error reading logs from Redis", err);
+        res.status(500).json({ error: "Internal server error reading logs" });
+    }
+});
+
+
+async function start() {
+    try {
+        if (!publisher.isOpen) {
+            await publisher.connect();
+        }
+        if (!subscriber.isOpen) {
+            await subscriber.connect();
+        }
+        app.listen(3000, () => console.log('Server listening on port 3000'));
+    } catch (err) {
+        console.error('Startup error:', err);
+        process.exit(1);
+    }
+}
+
+start();
